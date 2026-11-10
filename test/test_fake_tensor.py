@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 import unittest
 import weakref
 from unittest.mock import patch
@@ -6096,6 +6097,14 @@ if __name__ == "__main__":
             mode = CppFakeTensorMode(shape_env=shape_env)
         self.assertTrue(mode.fake_tensor_converter.meta_converter.copy_data)
         self.assertIs(mode.shape_env, shape_env)
+        # The stack is captured where the mode is created: in
+        # CppFakeTensorMode.__init__, called from here
+        *_, caller, init = mode._creation_traceback.summary()
+        self.assertEqual(init.name, "__init__")
+        init_file = init.filename.replace("\\", "/")
+        self.assertTrue(init_file.endswith("torch/_subclasses/fake_tensor.py"))
+        self.assertIn("test_cpp_fake_tensor_mode_init", caller.name)
+        self.assertTrue(mode.stack.endswith("".join(traceback.format_list([init]))))
         defaults = CppFakeTensorMode()
         self.assertFalse(defaults.fake_tensor_converter.meta_converter.copy_data)
         self.assertIsNone(defaults.shape_env)
