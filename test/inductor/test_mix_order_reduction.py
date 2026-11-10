@@ -1,5 +1,6 @@
 # Owner(s): ["module: inductor"]
 
+import functools
 import unittest
 from unittest import mock
 from unittest.mock import patch
@@ -8,9 +9,10 @@ import torch
 import torch._inductor.config as inductor_config
 import torch.nn.functional as F
 from torch import nn
-from torch._dynamo.utils import same
+from torch._dynamo.utils import counters, same
 from torch._inductor import metrics, utils
 from torch._inductor.choices import InductorChoices
+from torch._inductor.codegen.simd import _MixOrderTritonFinalize
 from torch._inductor.codegen.triton import FixedTritonConfig
 from torch._inductor.runtime.hints import DeviceProperties
 from torch._inductor.runtime.triton_heuristics import persistent_reduction
@@ -1048,7 +1050,10 @@ class MixOrderReductionTest(TestBase):
         self.assertEqual(metrics.codegen_mix_order_reduction, 1)
         # the slice grads alias the shared cat buffer: the final reduction
         # must be written through the view, never bound to a fresh tensor
-        FileCheck().check(".copy_(workspace_").run(wrapper)
+        if inductor_config.triton.mix_order_reduction_triton_finalize:
+            FileCheck().check(".run(workspace_").run(wrapper)
+        else:
+            FileCheck().check(".copy_(workspace_").run(wrapper)
         self.assertNotIn("= workspace_", wrapper)
         torch.testing.assert_close(ref_grad, act_grad, atol=1e-4, rtol=1e-4)
 
@@ -1848,6 +1853,66 @@ class MixOrderReductionNumericTest(TestBase):
         self.assertNotIn("'tma_min_block_sizes':", wrapper)
         self.assertNotIn("host_tma_descriptor_args", wrapper)
 
+    @inductor_config.patch(
+        {
+            "split_reductions": False,
+            "triton.cooperative_reductions": False,
+            "triton.force_cooperative_reductions": False,
+            "triton.mix_order_reduction": True,
+            "triton.mix_order_reduction_triton_finalize": True,
+        }
+    )
+    def test_triton_finalize_groups_accumulators(self, device):
+        def f(x):
+            y = x.float()
+            return (
+                y.sum(dim=1),
+                x.sum(dim=0),
+                (y * 2).sum(dim=0),
+                x.half().sum(dim=0),
+                (x * 3).sum(dim=0),
+                (y * 4).sum(dim=0),
+            )
+
+        # Integer values keep every fp32 partial sum exact, so each output must
+        # match eager bit for bit after its own cast.
+        x = torch.randint(-4, 5, (40960, 128), device=device).bfloat16()
+        expected = f(x)
+        counters.clear()
+        actual, (wrapper,) = utils.run_and_get_code(torch.compile(f), x)
+
+        self.assertEqual(metrics.codegen_mix_order_reduction, 1)
+        # Five column accumulators need two launches of at most four outputs.
+        self.assertEqual(counters["inductor"]["mix_order_triton_finalize"], 2)
+        FileCheck().check_count(".run(workspace_", 2, exactly=True).run(wrapper)
+        self.assertNotIn(".sum(dim=0)", wrapper)
+        for act, ref in zip(actual, expected):
+            self.assertEqual(act, ref, atol=0, rtol=0)
+
+    @inductor_config.patch(
+        {
+            "split_reductions": False,
+            "triton.cooperative_reductions": False,
+            "triton.force_cooperative_reductions": False,
+            "triton.mix_order_reduction": True,
+            "triton.mix_order_reduction_triton_finalize": True,
+        }
+    )
+    def test_triton_finalize_falls_back_above_max_nsplit(self, device):
+        def f(x):
+            return x.sum(dim=1), x.sum(dim=0)
+
+        x = torch.randint(-4, 5, (40960, 128), device=device).float()
+        counters.clear()
+        with mock.patch.object(_MixOrderTritonFinalize, "max_nsplit", 1):
+            actual, (wrapper,) = utils.run_and_get_code(torch.compile(f), x)
+
+        self.assertEqual(metrics.codegen_mix_order_reduction, 1)
+        self.assertEqual(counters["inductor"]["mix_order_triton_finalize"], 0)
+        self.assertNotIn(".run(workspace_", wrapper)
+        self.assertIn(".sum(dim=0)", wrapper)
+        self.assertEqual(actual, f(x), atol=0, rtol=0)
+
 
 instantiate_device_type_tests(
     MixOrderReductionNumericTest,
@@ -1933,6 +1998,51 @@ class MixOrderReductionHeuristicTest(TestBase):
 )
 class NoMixOrderReductionTest(MixOrderReductionTest):
     pass
+
+
+@inductor_config.patch(
+    {
+        "triton.cooperative_reductions": False,
+        "triton.force_cooperative_reductions": False,
+        "triton.mix_order_reduction": True,
+        "triton.mix_order_reduction_triton_finalize": True,
+    }
+)
+class MixOrderReductionTritonFinalizeTest(TestBase):
+    pass
+
+
+def _expect_triton_finalize(test):
+    @functools.wraps(test)
+    def wrapper(self):
+        counters.clear()
+        test(self)
+        self.assertGreater(counters["inductor"]["mix_order_triton_finalize"], 0)
+
+    return wrapper
+
+
+# MixOrderReductionTest cases whose column sums reach the Triton finalizer.
+_TRITON_FINALIZE_CASES = (
+    "test_mix_order_reduction_name_sum",
+    "test_non_contiguous_input",
+    "test_multi_workspace_allocation",
+    "test_rms_norm_bwd_tma_small",
+    "test_layer_norm_bwd_with_bias",
+    "test_rms_norm_bwd_with_dynamic_shape",
+    "test_layer_norm_bwd_with_dynamic_shape",
+    "test_layer_norm_bwd_no_bias",
+    "test_rms_norm_sharing_weights",
+    "test_layer_norm_sharing_weights",
+    "test_chained_modulated_norm_shared_table",
+)
+for _name in dir(MixOrderReductionTest):
+    if any(_name == c or _name.startswith(f"{c}_") for c in _TRITON_FINALIZE_CASES):
+        setattr(
+            MixOrderReductionTritonFinalizeTest,
+            _name,
+            _expect_triton_finalize(getattr(MixOrderReductionTest, _name)),
+        )
 
 
 if __name__ == "__main__":
