@@ -130,9 +130,11 @@ if CPP_FAKETENSOR:
         allow_non_fake_inputs=False,
         **kwargs,
     ):
-        if not allow_fallback_kernels or allow_non_fake_inputs or kwargs:
+        if not allow_fallback_kernels or kwargs:
             raise NotImplementedError("CppFakeTensorMode has no such options yet")
-        return CppFakeTensorMode(shape_env=shape_env)
+        return CppFakeTensorMode(
+            shape_env=shape_env, allow_non_fake_inputs=allow_non_fake_inputs
+        )
 
     FakeTensorModeCls = CppFakeTensorMode
 else:
@@ -6105,6 +6107,34 @@ if __name__ == "__main__":
         meta = torch.empty((), device="meta")
         fake = torch._C._from_meta_and_device(meta, torch.device("cpu"), mode)
         self.assertIs(torch._C._maybe_get_fake_mode(fake), mode)
+
+    @parametrize("previous", [False, True])
+    def test_cpp_fake_tensor_mode_allow_non_fake_inputs(self, previous):
+        from torch._subclasses.fake_tensor import (
+            allow_non_fake_inputs_temporarily,
+            CppFakeTensorMode,
+        )
+
+        # Defaults to False, like FakeTensorMode, and is stored on the C++ mode
+        # apart from its other flags
+        self.assertFalse(CppFakeTensorMode().allow_non_fake_inputs)
+        mode = CppFakeTensorMode(allow_non_fake_inputs=True)
+        self.assertTrue(mode.allow_non_fake_inputs)
+        mode.allow_non_fake_inputs = False
+        self.assertFalse(mode.allow_non_fake_inputs)
+        self.assertTrue(mode.allow_meta)
+        self.assertTrue(mode._allow_unsafe_data_ptr_access)
+        # allow_non_fake_inputs_temporarily restores the previous value, also
+        # when the body raises
+        mode.allow_non_fake_inputs = previous
+        with allow_non_fake_inputs_temporarily(mode):
+            self.assertTrue(mode.allow_non_fake_inputs)
+        self.assertEqual(mode.allow_non_fake_inputs, previous)
+        with self.assertRaisesRegex(ValueError, "raised in the body"):
+            with allow_non_fake_inputs_temporarily(mode):
+                self.assertTrue(mode.allow_non_fake_inputs)
+                raise ValueError("raised in the body")
+        self.assertEqual(mode.allow_non_fake_inputs, previous)
 
     # Dynamo keeps references that stop the mode being collected
     @xfailIfTorchDynamo
