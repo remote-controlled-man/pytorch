@@ -16,7 +16,7 @@ struct FakeTensorModeTLSState {
   FakeTensorModeTLSState(FakeTensorModeTLSState&&) = delete;
   FakeTensorModeTLSState& operator=(FakeTensorModeTLSState&&) = delete;
 
-  std::shared_ptr<FakeTensorMode> state;
+  std::shared_ptr<FakeTensorModeHandle> state;
 
   ~FakeTensorModeTLSState() {
     // Last release can run Python, including lookups from weakref callbacks.
@@ -30,7 +30,7 @@ thread_local FakeTensorModeTLSState fakeTensorModeState;
 
 } // namespace
 
-void FakeTensorModeTLS::set_state(std::shared_ptr<FakeTensorMode> state) {
+void FakeTensorModeTLS::set_state(std::shared_ptr<FakeTensorModeHandle> state) {
   if (state) {
     TORCH_CHECK(
         !fakeTensorModeTLSClosed,
@@ -43,8 +43,8 @@ void FakeTensorModeTLS::set_state(std::shared_ptr<FakeTensorMode> state) {
   fakeTensorModeState.state = std::move(state);
 }
 
-std::shared_ptr<FakeTensorMode> FakeTensorModeTLS::create_state(
-    std::shared_ptr<FakeTensorMode> state) {
+std::shared_ptr<FakeTensorModeHandle> FakeTensorModeTLS::create_state(
+    std::shared_ptr<FakeTensorModeHandle> state) {
   if (fakeTensorModeTLSClosed) {
     TORCH_CHECK(
         !state, "Cannot install a C++ FakeTensorMode during thread teardown");
@@ -53,7 +53,7 @@ std::shared_ptr<FakeTensorMode> FakeTensorModeTLS::create_state(
   return std::exchange(fakeTensorModeState.state, std::move(state));
 }
 
-std::shared_ptr<FakeTensorMode> FakeTensorModeTLS::get_state() {
+std::shared_ptr<FakeTensorModeHandle> FakeTensorModeTLS::get_state() {
   return fakeTensorModeTLSClosed ? nullptr : fakeTensorModeState.state;
 }
 
@@ -62,7 +62,7 @@ void FakeTensorModeTLS::reset_state() {
     return;
   }
   // Released once the slot and key are updated, as releasing the last
-  // reference to a mode can release its converter, running Python
+  // reference to a handle releases its mode's Python object, running Python
   auto state = std::move(fakeTensorModeState.state);
   tls_set_dispatch_key_included(DispatchKey::Fake, false);
 }
